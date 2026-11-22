@@ -22,6 +22,14 @@ extends PanelContainer
 enum DockMode { MATERIAL, PAINT, STAMP, SPRITE, SHAPE, PARTICLE }
 const DEFAULT_MATERIAL_PATH := "res://addons/poibuilder/materials/pb_default_material.tres"
 const SETTING_DEFAULT_MATERIAL := "poibuilder/materials/default_material_path"
+## Files picked with "+ Add", remembered per project (ProjectSettings, so the
+## list is committed with project.godot and shared across machines).
+const SETTING_ADDED_PATHS := "poibuilder/materials/added_paths"
+## Folders scanned in full on every refresh, past the blind project scan's
+## depth and size caps (e.g. an asset pack's Textures folder).
+const SETTING_SCAN_FOLDERS := "poibuilder/materials/scan_folders"
+const SCAN_FOLDER_MAX_DEPTH := 8
+const SCAN_FOLDER_LIMIT := 500
 
 ## Emitted when the mode row switches tabs. The plugin owns what each mode
 ## ARMS in the viewport (sprite placement, shape placement) and drives the
@@ -56,6 +64,7 @@ var _scroll: ScrollContainer
 var _material_grid: HFlowContainer
 var _status_label: Label
 var _file_dialog: EditorFileDialog
+var _folder_dialog: EditorFileDialog
 
 # UI Nodes - Sections Container
 var _uv_and_tint_section: VBoxContainer
@@ -350,9 +359,15 @@ func _build_ui() -> void:
 
 	var btn_add := Button.new()
 	btn_add.text = "+ Add"
-	btn_add.tooltip_text = "Add material or texture from project..."
+	btn_add.tooltip_text = "Add material or texture from project... (remembered for this project)"
 	btn_add.pressed.connect(_on_add_material_pressed)
 	mat_header.add_child(btn_add)
+
+	var btn_add_folder := Button.new()
+	btn_add_folder.text = "+ Folder"
+	btn_add_folder.tooltip_text = "Scan a folder (and its subfolders) for materials and textures on every refresh"
+	btn_add_folder.pressed.connect(_on_add_folder_pressed)
+	mat_header.add_child(btn_add_folder)
 
 	var btn_refresh := Button.new()
 	btn_refresh.text = "↺"
@@ -1276,7 +1291,9 @@ func _select_particle_material(mat: Material) -> void:
 	if tex == null:
 		return
 	if particle_placer != null:
-		var path := str(mat.get_meta("source_texture_path")) if mat.has_meta("source_texture_path") else tex.resource_path
+		var path := _texture_source_path(mat)
+		if path.is_empty():
+			path = tex.resource_path
 		particle_placer.last_texture = tex
 		particle_placer.last_values = PBParticleParams.preset_for_texture(path)
 	_update_tool_labels()
@@ -1305,8 +1322,8 @@ func _refresh_particle_labels() -> void:
 ## palette just stays unselected.
 func _auto_select_particle() -> void:
 	for mat in _project_materials:
-		if mat != null and mat.has_meta("source_texture_path") \
-				and PBAssetCatalog.classify_path(mat.get_meta("source_texture_path")) == "particle":
+		var src := _texture_source_path(mat)
+		if not src.is_empty() and PBAssetCatalog.classify_path(src) == "particle":
 			_select_particle_material(mat)
 			return
 
@@ -1317,13 +1334,38 @@ func _auto_select_particle() -> void:
 func _select_first_classified(category: String, select_fn: Callable) -> void:
 	if _project_materials.is_empty():
 		return
+	var def_mat := get_default_material()
 	for mat in _project_materials:
-		if not mat.has_meta("source_texture_path"):
+		if mat == def_mat:
 			continue
-		if PBAssetCatalog.classify_path(mat.get_meta("source_texture_path")) == category:
+		var src := _texture_source_path(mat)
+		if src.is_empty():
+			continue
+		if PBAssetCatalog.classify_path(src) == category:
 			select_fn.call(mat)
 			return
 	select_fn.call(_project_materials[0])
+
+## The image a palette card paints/stamps/places with, used to sort it into
+## the picker tabs: a wrapped texture's own path, or a saved material's albedo
+## texture (so a .tres can be painted with like its .png). "" when the card
+## has no texture image to offer.
+func _texture_source_path(mat: Material) -> String:
+	if mat == null:
+		return ""
+	if mat.has_meta("source_texture_path"):
+		return str(mat.get_meta("source_texture_path"))
+
+	var tex: Texture2D = null
+	if mat is StandardMaterial3D:
+		tex = (mat as StandardMaterial3D).albedo_texture
+	elif mat is ShaderMaterial:
+		var param = (mat as ShaderMaterial).get_shader_parameter("base_texture")
+		if param is Texture2D:
+			tex = param
+	if tex == null:
+		return ""
+	return tex.resource_path
 func _extract_texture(mat: Material) -> Texture2D:
 	if mat is StandardMaterial3D and mat.albedo_texture != null:
 		return mat.albedo_texture
@@ -1444,15 +1486,26 @@ func refresh_materials() -> void:
 		for m in editor.active_mesh.pb_mesh_data.materials:
 			_append_material_once(m)
 
-	# 3. The addon's OWN bundled textures register on EVERY project — a fresh
+	# 3. Files the user added by hand (remembered per project). Missing files
+	# (moved or deleted since) are skipped, not dropped from the setting.
+	for path in _get_path_list_setting(SETTING_ADDED_PATHS):
+		_add_palette_path(path)
+
+	# 4. The addon's OWN bundled textures register on EVERY project — a fresh
 	# install has no res://materials yet, and the depth-limited scan below
 	# never reaches addons/poibuilder/materials/textures (4 levels down). This
 	# is where the water/particle/waterfall sheets and shipped stamps come
 	# from on a fresh project.
 	_scan_dir_for_materials("res://addons/poibuilder/materials/textures")
 
-	# 4. Scan the rest of the project for materials and texture images
+	# 5. Scan the rest of the project for materials and texture images
 	_scan_dir_for_materials("res://")
+
+	# 6. Folders the user asked to scan: deeper, and with their own cap, so
+	# a large asset pack isn't cut off by the blind scan's 60-material limit.
+	for folder in _get_path_list_setting(SETTING_SCAN_FOLDERS):
+		_scan_dir_for_materials(folder, 0, SCAN_FOLDER_MAX_DEPTH,
+			_project_materials.size() + SCAN_FOLDER_LIMIT)
 
 	_collapse_duplicate_materials()
 	_rebuild_material_grid()
@@ -1523,8 +1576,9 @@ func _append_material_once(mat: Material) -> bool:
 	_project_materials.append(mat)
 	return true
 
-func _scan_dir_for_materials(dir_path: String, depth: int = 0) -> void:
-	if depth > 3 or _project_materials.size() > 60:
+func _scan_dir_for_materials(dir_path: String, depth: int = 0, max_depth: int = 3,
+		limit: int = 60) -> void:
+	if depth > max_depth or _project_materials.size() > limit:
 		return
 	var d := DirAccess.open(dir_path)
 	if d == null:
@@ -1535,7 +1589,7 @@ func _scan_dir_for_materials(dir_path: String, depth: int = 0) -> void:
 		if not name_str.begins_with(".") and not name_str.begins_with(".godot"):
 			var full_path := dir_path.path_join(name_str)
 			if d.current_is_dir():
-				_scan_dir_for_materials(full_path, depth + 1)
+				_scan_dir_for_materials(full_path, depth + 1, max_depth, limit)
 			else:
 				var ext := name_str.get_extension().to_lower()
 				if ext == "tres" or ext == "material":
@@ -1552,21 +1606,27 @@ func _scan_dir_for_materials(dir_path: String, depth: int = 0) -> void:
 						if ResourceLoader.exists(full_path):
 							var tex = ResourceLoader.load(full_path)
 							if tex is Texture2D:
-								var mat := StandardMaterial3D.new()
-								mat.resource_name = name_str.get_basename().capitalize()
-								mat.set_meta("source_texture_path", full_path)
-								mat.albedo_texture = tex
-								mat.roughness = 0.8
-								mat.vertex_color_use_as_albedo = true
-								mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS
-								# The palette preview must match the retro bake:
-								# alpha is taken from the texture's pixels
-								# (water/waterfall sheets blend, foliage cuts),
-								# never left opaque until export fixes it.
-								PBAlphaDetect.ensure_transparency(mat)
-								_append_material_once(mat)
+								_append_material_once(_make_texture_material(tex, full_path))
 		name_str = d.get_next()
 	d.list_dir_end()
+
+## Wraps a texture in the palette's material. The `source_texture_path` meta
+## is what the PAINT/STAMP/SPRITE/PARTICLE pickers filter on, so every texture
+## card (scanned or added by hand) must carry it.
+func _make_texture_material(tex: Texture2D, path: String) -> StandardMaterial3D:
+	var mat := StandardMaterial3D.new()
+	mat.resource_name = path.get_file().get_basename().capitalize()
+	mat.set_meta("source_texture_path", path)
+	mat.albedo_texture = tex
+	mat.roughness = 0.8
+	mat.vertex_color_use_as_albedo = true
+	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS
+
+	# The palette preview must match the retro bake: alpha is taken from the
+	# texture's pixels (water/waterfall sheets blend, foliage cuts), never left
+	# opaque until export fixes it.
+	PBAlphaDetect.ensure_transparency(mat)
+	return mat
 
 func _rebuild_material_grid() -> void:
 	if _material_grid == null:
@@ -1584,9 +1644,10 @@ func _rebuild_material_grid() -> void:
 		# own tabs instead of flooding Material & UV.
 		if dock_mode == DockMode.PAINT or dock_mode == DockMode.STAMP or dock_mode == DockMode.SPRITE \
 				or dock_mode == DockMode.PARTICLE:
-			if not mat.has_meta("source_texture_path"):
+			var src := _texture_source_path(mat)
+			if src.is_empty():
 				continue
-			var cat: String = PBAssetCatalog.classify_path(mat.get_meta("source_texture_path"))
+			var cat: String = PBAssetCatalog.classify_path(src)
 			match dock_mode:
 				DockMode.PAINT:
 					if cat != "texture":
@@ -1723,6 +1784,11 @@ func _show_context_menu(mat: Material, pos: Vector2) -> void:
 	_context_menu.add_item("Set as Particle Texture", 7)
 	_context_menu.add_separator()
 	_context_menu.add_item("Copy Path", 3)
+	if not _added_path_for(mat).is_empty():
+		_context_menu.add_item("Remove from Palette", 8)
+	var scan_folder := _scan_folder_for(mat)
+	if not scan_folder.is_empty():
+		_context_menu.add_item("Stop Scanning %s" % scan_folder.trim_suffix("/").get_file(), 9)
 	_context_menu.popup(Rect2i(Vector2i(pos), Vector2i(190, 130)))
 
 func _on_context_menu_id_pressed(id: int) -> void:
@@ -1752,6 +1818,20 @@ func _on_context_menu_id_pressed(id: int) -> void:
 		7: # Particle
 			_select_particle_material(_context_material)
 			_set_dock_mode(DockMode.PARTICLE)
+		8: # Remove a hand-added entry
+			var added := _get_path_list_setting(SETTING_ADDED_PATHS)
+			var idx := added.find(_added_path_for(_context_material))
+			if idx >= 0:
+				added.remove_at(idx)
+				_set_path_list_setting(SETTING_ADDED_PATHS, added)
+				refresh_materials()
+		9: # Stop scanning a folder
+			var folders := _get_path_list_setting(SETTING_SCAN_FOLDERS)
+			var fidx := folders.find(_scan_folder_for(_context_material))
+			if fidx >= 0:
+				folders.remove_at(fidx)
+				_set_path_list_setting(SETTING_SCAN_FOLDERS, folders)
+				refresh_materials()
 
 func _on_add_material_pressed() -> void:
 	if _file_dialog == null:
@@ -1763,20 +1843,84 @@ func _on_add_material_pressed() -> void:
 	_file_dialog.popup_file_dialog()
 
 func _on_file_dialog_selected(path: String) -> void:
-	if ResourceLoader.exists(path):
-		var res = ResourceLoader.load(path)
-		if res is Material:
-			if not _project_materials.has(res):
-				_project_materials.append(res)
-				_rebuild_material_grid()
-		elif res is Texture2D:
-			var mat := StandardMaterial3D.new()
-			mat.resource_name = path.get_file().get_basename().capitalize()
-			mat.albedo_texture = res
-			mat.roughness = 0.8
-			PBAlphaDetect.ensure_transparency(mat)
-			_project_materials.append(mat)
-			_rebuild_material_grid()
+	if not _add_palette_path(path):
+		return
+
+	var added := _get_path_list_setting(SETTING_ADDED_PATHS)
+	if not added.has(path):
+		added.append(path)
+		_set_path_list_setting(SETTING_ADDED_PATHS, added)
+
+	_rebuild_material_grid()
+
+func _on_add_folder_pressed() -> void:
+	if _folder_dialog == null:
+		_folder_dialog = EditorFileDialog.new()
+		_folder_dialog.file_mode = EditorFileDialog.FILE_MODE_OPEN_DIR
+		_folder_dialog.dir_selected.connect(_on_folder_dialog_selected)
+		add_child(_folder_dialog)
+	_folder_dialog.popup_file_dialog()
+
+func _on_folder_dialog_selected(dir: String) -> void:
+	var folders := _get_path_list_setting(SETTING_SCAN_FOLDERS)
+	if folders.has(dir):
+		return
+	folders.append(dir)
+	_set_path_list_setting(SETTING_SCAN_FOLDERS, folders)
+
+	refresh_materials()
+
+## Loads a material or texture file into the palette (textures get wrapped).
+## Returns false when the file is missing or isn't either kind.
+func _add_palette_path(path: String) -> bool:
+	if not ResourceLoader.exists(path):
+		return false
+
+	var res = ResourceLoader.load(path)
+	if res is Material:
+		_append_material_once(res)
+		return true
+	if res is Texture2D:
+		# Claim the name so the project scan doesn't wrap the same image again.
+		_scanned_texture_paths[path.get_file()] = true
+		_append_material_once(_make_texture_material(res, path))
+		return true
+	return false
+
+func _get_path_list_setting(setting: String) -> PackedStringArray:
+	if not ProjectSettings.has_setting(setting):
+		return PackedStringArray()
+	return PackedStringArray(ProjectSettings.get_setting(setting))
+
+func _set_path_list_setting(setting: String, paths: PackedStringArray) -> void:
+	# An empty list removes the key so project.godot stays clean.
+	ProjectSettings.set_setting(setting, paths if not paths.is_empty() else null)
+	if not paths.is_empty():
+		ProjectSettings.add_property_info({"name": setting, "type": TYPE_PACKED_STRING_ARRAY})
+	if Engine.is_editor_hint():
+		ProjectSettings.save()
+
+## The "+ Add" entry a palette card came from, or "" when it wasn't added
+## by hand (scanned, bundled, or from the mesh).
+func _added_path_for(mat: Material) -> String:
+	var added := _get_path_list_setting(SETTING_ADDED_PATHS)
+	if not mat.resource_path.is_empty() and added.has(mat.resource_path):
+		return mat.resource_path
+	if mat.has_meta("source_texture_path"):
+		var src := str(mat.get_meta("source_texture_path"))
+		if added.has(src):
+			return src
+	return ""
+
+## The scan folder a palette card was found in, or "" when none.
+func _scan_folder_for(mat: Material) -> String:
+	var path := _get_material_or_texture_path(mat)
+	if path.is_empty():
+		return ""
+	for folder in _get_path_list_setting(SETTING_SCAN_FOLDERS):
+		if path.begins_with(folder.trim_suffix("/") + "/"):
+			return folder
+	return ""
 
 # ==============================================================================
 # Selection Synchronization & UI State
