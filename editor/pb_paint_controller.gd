@@ -134,6 +134,22 @@ var stamp_opacity: float = 1.0:
 		_update_preview_material()
 		stamp_changed.emit()
 
+## How a stamp click lands. DECAL_NODE adds a Godot Decal node (the texture at
+## full resolution, movable afterwards, the mesh's material untouched); PAINT
+## pastes the image into the face's decal layer at DECAL_TEXELS_PER_M.
+enum StampPlacement { PAINT, DECAL_NODE }
+var stamp_placement: StampPlacement = StampPlacement.DECAL_NODE:
+	set(v):
+		stamp_placement = v
+		stamp_changed.emit()
+
+## Thickness of a placed Decal node's projection box, centred on the surface:
+## enough to cover slightly uneven geometry without reaching through a wall.
+const DECAL_NODE_DEPTH := 0.3
+## Fades the decal on surfaces angled away from it, so the box never smears
+## the image down a perpendicular face or onto a wall's back side.
+const DECAL_NODE_NORMAL_FADE := 0.3
+
 ## What the decal brush writes: a solid brush colour, or the palette image.
 enum BrushSource { COLOR, IMAGE }
 
@@ -460,8 +476,9 @@ func update_cursor(point: Vector3, normal: Vector3, mesh_node: PBMesh, face_idx:
 		var rot_up := -sin(rot_rad) * u_right + cos(rot_rad) * v_up
 		var xf := Transform3D(Basis(rot_right, rot_up, n_axis), offset_point)
 		stamp_mesh_instance.global_transform = xf
-		# A paste that cannot happen gets no preview quad.
-		stamp_mesh_instance.visible = paintable
+		# A paste that cannot happen gets no preview quad. A Decal node never
+		# touches the surface's material, so it can land on any surface.
+		stamp_mesh_instance.visible = paintable or stamp_placement == StampPlacement.DECAL_NODE
 		if brush_mesh_instance != null:
 			brush_mesh_instance.visible = false
 
@@ -821,9 +838,12 @@ func end_stroke() -> void:
 func apply_stamp() -> void:
 	if mode != Mode.STAMP or target_mesh == null or not is_instance_valid(target_mesh) or not has_hit:
 		return
-	if not paintable:
-		return
 	if stamp_texture == null:
+		return
+	if stamp_placement == StampPlacement.DECAL_NODE:
+		place_stamp_decal_node()
+		return
+	if not paintable:
 		return
 	var data := target_mesh.pb_mesh_data
 	if data == null:
@@ -852,6 +872,68 @@ func apply_stamp() -> void:
 		"after": PBCommand.copy_mesh_data(data),
 	}})
 	stroke_committed.emit()
+
+## Places the stamp as a Godot Decal node exactly where the preview quad sits:
+## same width, aspect, rotation and facing. It's parented to the stamped mesh
+## (so it moves with it) and owned by the edited scene (so it saves). Returns
+## the new node, or null when there's nothing to place.
+func place_stamp_decal_node() -> Decal:
+	if target_mesh == null or not is_instance_valid(target_mesh) or not has_hit or stamp_texture == null:
+		return null
+
+	var decal := build_stamp_decal(stamp_texture, cursor_point, cursor_normal,
+			stamp_rotation, stamp_scale, stamp_opacity)
+	var parent: Node3D = target_mesh
+	var local_xf := parent.global_transform.affine_inverse() * decal.transform
+	decal.name = "Decal_" + stamp_texture.resource_path.get_file().get_basename()
+
+	var root: Node = null
+	if Engine.is_editor_hint():
+		root = EditorInterface.get_edited_scene_root()
+	if root == null:
+		root = parent.owner if parent.owner != null else parent
+
+	var undo = plugin.get_undo_redo() if plugin != null and plugin.has_method("get_undo_redo") else null
+	if undo == null:
+		parent.add_child(decal, true)
+		decal.transform = local_xf
+		decal.owner = root
+		return decal
+
+	undo.create_action("Place Stamp Decal", UndoRedo.MERGE_DISABLE, parent)
+	undo.add_do_method(parent, "add_child", decal, true)
+	undo.add_do_property(decal, "transform", local_xf)
+	undo.add_do_property(decal, "owner", root)
+	undo.add_do_reference(decal)
+	undo.add_undo_method(parent, "remove_child", decal)
+	undo.commit_action()
+	return decal
+
+## A Decal node matching the stamp preview at `point` on a surface facing
+## `normal` (world space). The preview quad's basis is (right, up, normal); a
+## Decal projects along its -Y with the image's top toward -Z, so its basis is
+## (right, normal, -up) — the same handedness, the same image orientation.
+static func build_stamp_decal(tex: Texture2D, point: Vector3, normal: Vector3,
+		rotation_deg: float, width_m: float, opacity: float) -> Decal:
+	var sbasis := PBSplat.get_stamp_basis(normal.normalized())
+	var u_right: Vector3 = sbasis["right"]
+	var v_up: Vector3 = sbasis["up"]
+	var n_axis: Vector3 = sbasis["normal"]
+	var rot_rad := deg_to_rad(rotation_deg)
+	var rot_right := cos(rot_rad) * u_right + sin(rot_rad) * v_up
+	var rot_up := -sin(rot_rad) * u_right + cos(rot_rad) * v_up
+
+	var aspect := 1.0
+	if tex.get_width() > 0:
+		aspect = float(tex.get_height()) / float(tex.get_width())
+
+	var decal := Decal.new()
+	decal.texture_albedo = tex
+	decal.modulate = Color(1.0, 1.0, 1.0, opacity)
+	decal.size = Vector3(width_m, DECAL_NODE_DEPTH, width_m * aspect)
+	decal.normal_fade = DECAL_NODE_NORMAL_FADE
+	decal.transform = Transform3D(Basis(rot_right, n_axis, -rot_up), point)
+	return decal
 
 ## Clears the decal layer of every material on `mesh` (all stamps and painted
 ## decal pixels at once). Undoable through the mesh snapshot.

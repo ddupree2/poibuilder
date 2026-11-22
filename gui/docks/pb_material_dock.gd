@@ -138,6 +138,7 @@ var _active_stamp_label: Label
 var _opt_paint_target: OptionButton
 var _btn_clear_stamps: Button
 var _stamp_hint: Label
+var _opt_stamp_placement: OptionButton
 var _spin_stamp_scale: Range
 var _spin_stamp_rotation: Range
 var _spin_stamp_opacity: Range
@@ -191,7 +192,25 @@ func set_paint_controller(val: PBPaintController) -> void:
 			paint_controller.brush_changed.connect(_on_paint_controller_changed)
 		if not paint_controller.stamp_changed.is_connected(_on_paint_controller_changed):
 			paint_controller.stamp_changed.connect(_on_paint_controller_changed)
+		if _opt_stamp_placement != null:
+			_opt_stamp_placement.select(
+				_opt_stamp_placement.get_item_index(paint_controller.stamp_placement))
+			_update_stamp_hint()
 	sync_selection()
+
+## The Stamp tab's hint follows the placement choice.
+func _update_stamp_hint() -> void:
+	if _stamp_hint == null:
+		return
+
+	var as_node := true
+	if _opt_stamp_placement != null and _opt_stamp_placement.selected >= 0:
+		as_node = _opt_stamp_placement.get_selected_id() == PBPaintController.StampPlacement.DECAL_NODE
+
+	if as_node:
+		_stamp_hint.text = "Click to place a Decal node at full resolution (no dragging).\nIt's added under the clicked mesh: select it in the Scene tree to move, scale or delete it."
+	else:
+		_stamp_hint.text = "Click to paste the image as a decal (no dragging).\nIt paints across every face it touches — overhanging an edge or wrapping a corner."
 
 func _on_paint_controller_changed() -> void:
 	if _syncing or paint_controller == null:
@@ -729,6 +748,19 @@ func _build_ui() -> void:
 	stamp_grid.columns = 2
 	stamp_grid.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 
+	stamp_grid.add_child(_make_label("Place as:"))
+	_opt_stamp_placement = OptionButton.new()
+	_opt_stamp_placement.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_opt_stamp_placement.add_item("Decal node", PBPaintController.StampPlacement.DECAL_NODE)
+	_opt_stamp_placement.add_item("Paint into surface", PBPaintController.StampPlacement.PAINT)
+	_opt_stamp_placement.tooltip_text = "Decal node: adds a Godot Decal at full texture resolution that you can move, scale or delete afterwards.\nPaint into surface: bakes the image into the face's decal layer (256 px per metre; can only be erased)."
+	_opt_stamp_placement.item_selected.connect(func(index: int):
+		if paint_controller != null:
+			paint_controller.stamp_placement = _opt_stamp_placement.get_item_id(index)
+		_update_stamp_hint()
+	)
+	stamp_grid.add_child(_opt_stamp_placement)
+
 	stamp_grid.add_child(_make_label("Scale:"))
 	var scale_box := HBoxContainer.new()
 	scale_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -799,10 +831,10 @@ func _build_ui() -> void:
 	_stamp_tool_section.add_child(btn_clear_stamps)
 
 	_stamp_hint = Label.new()
-	_stamp_hint.text = "Click to paste the image as a decal (no dragging).\nIt paints across every face it touches — overhanging an edge or wrapping a corner."
 	_stamp_hint.add_theme_color_override("font_color", Color(0.65, 0.75, 0.85))
 	_stamp_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	_stamp_tool_section.add_child(_stamp_hint)
+	_update_stamp_hint()
 
 	# Stamps and the brush write into the SAME pixels, so the erase path lives
 	# in the Paint tab — hand the user straight to it instead of describing it.
