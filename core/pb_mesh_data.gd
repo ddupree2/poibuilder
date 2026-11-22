@@ -896,8 +896,12 @@ static func get_default_material() -> Material:
 		return _cached_default_material
 
 	var path := ""
-	if Engine.is_editor_hint():
-		var iface := EditorInterface
+	# Looked up by name, never written as `EditorInterface`: exported games run
+	# on templates without editor classes, where that identifier fails to
+	# compile. This script would then fail to load, and every PBMesh in the
+	# game would fall back to a plain mesh with no collider.
+	if Engine.is_editor_hint() and Engine.has_singleton(&"EditorInterface"):
+		var iface = Engine.get_singleton(&"EditorInterface")
 		if iface != null:
 			var settings = iface.get_editor_settings()
 			if settings != null and settings.has_setting("poibuilder/materials/default_material_path"):
