@@ -59,7 +59,7 @@ static func extrude_faces(mesh_data: PBMeshData, face_ids: PackedInt32Array,
 
 	for region: PackedInt32Array in _face_regions(mesh_data, face_ids):
 		var dir := _region_normal(mesh_data, region)
-		if dir.length_squared() < 0.5:
+		if _region_normal_degenerate(mesh_data, region, dir):
 			return _fail("Extrude faces: degenerate region normal")
 		var offset := dir.normalized() * distance
 
@@ -2158,6 +2158,22 @@ static func _region_normal(mesh_data: PBMeshData, region: PackedInt32Array) -> V
 	for fi in region:
 		acc += _face_area_normal(mesh_data, mesh_data.faces[fi])
 	return acc
+
+## True when a region has no usable extrude direction: zero area, or face
+## normals that (almost) cancel out. `dir` is the region's summed area normal,
+## whose length is twice the area, so it's judged against the region's own
+## total area. A fixed threshold rejected every small face (a 0.2 x 1.4 m wall
+## end has an area normal of length 0.56) while letting big faces through.
+static func _region_normal_degenerate(mesh_data: PBMeshData, region: PackedInt32Array,
+		dir: Vector3) -> bool:
+	var total := 0.0
+	for fi in region:
+		total += _face_area_normal(mesh_data, mesh_data.faces[fi]).length()
+
+	if total < 0.0000001:
+		return true
+
+	return dir.length() < total * 0.01
 
 static func _face_area_normal(mesh_data: PBMeshData, face: PBFace) -> Vector3:
 	var acc := Vector3.ZERO
