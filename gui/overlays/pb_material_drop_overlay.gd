@@ -5,8 +5,9 @@
 ## - If multiple faces are selected and dropped onto one of the selected faces -> applies to all selected faces.
 ## - Otherwise -> applies to that face instantly.
 ##
-## Remains completely inert (MOUSE_FILTER_IGNORE) when not dragging, ensuring zero
-## interference with normal viewport clicks, gizmo drags, or box selections.
+## Remains completely inert (MOUSE_FILTER_IGNORE) except while a material is being
+## dragged, ensuring zero interference with normal viewport clicks, gizmo drags,
+## box selections, or dropping scenes/meshes into the viewport.
 @tool
 class_name PBMaterialDropOverlay
 extends Control
@@ -22,7 +23,13 @@ func _init() -> void:
 func _notification(what: int) -> void:
 	match what:
 		NOTIFICATION_DRAG_BEGIN:
-			mouse_filter = Control.MOUSE_FILTER_PASS
+			# Only intercept material drags. Catching every drag hides the 3D
+			# viewport's own drop target (a sibling, not a parent, so Godot never
+			# falls through to it) and breaks dragging scenes/meshes into the view.
+			var vp := get_viewport()
+			var data: Variant = vp.gui_get_drag_data() if vp != null else null
+			if _is_material_data(data):
+				mouse_filter = Control.MOUSE_FILTER_PASS
 		NOTIFICATION_DRAG_END:
 			mouse_filter = Control.MOUSE_FILTER_IGNORE
 
